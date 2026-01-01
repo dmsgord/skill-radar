@@ -1,0 +1,17 @@
+# Игнорируем системный мусор Windows
+Thumbs.db
+Desktop.ini
+
+# Игнорируем настройки редакторов
+.vscode/
+.idea/
+
+# Игнорируем временные файлы Python (на будущее)
+__pycache__/
+*.py[cod]
+venv/
+.env
+
+# Игнорируем данные Докера (если они появятся в папке)
+clickhouse_data/
+kafka_data/
