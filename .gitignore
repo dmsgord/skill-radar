@@ -1,1 +1,7 @@
 logs/
+clickhouse_data/
+clickhouse_data/
+logs/
+venv/
+__pycache__/
+.env
