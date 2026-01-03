@@ -1,40 +1,51 @@
-version: '3'
+version: '3.8'
+
+networks:
+  skillradar_net:
+    driver: bridge
+
+volumes:
+  zookeeper_data:
+  kafka_data:
+  clickhouse_data:
+  clickhouse_logs:
+  airflow_logs:
+  airflow_plugins:
+  metabase_data:
 
 services:
-  # 1. Оркестратор (Управляет процессами)
-  airflow:
-    image: apache/airflow:2.7.1
-    container_name: airflow
-    environment:
-      - AIRFLOW__CORE__EXECUTOR=SequentialExecutor
-      - AIRFLOW__DATABASE__SQL_ALCHEMY_CONN=sqlite:////opt/airflow/airflow.db
-      - AIRFLOW__CORE__LOAD_EXAMPLES=False
-      - AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION=True
-    volumes:
-      - ./dags:/opt/airflow/dags
-      - ./logs:/opt/airflow/logs
-    ports:
-      - "8081:8080"
-    command: bash -c "airflow db init && airflow users create --username admin --firstname Admin --lastname User --role Admin --email admin@example.com --password admin && airflow webserver & airflow scheduler"
-    depends_on:
-      - kafka
-      - clickhouse
-
-  # 2. Брокер сообщений (Почта)
+  # --- Zookeeper ---
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
-    container_name: zookeeper
+    container_name: skillradar_zookeeper
+    hostname: zookeeper
+    restart: unless-stopped
+    networks:
+      - skillradar_net
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    healthcheck:
+      test: echo srvr | nc localhost 2181 || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
+  # --- Kafka ---
   kafka:
     image: confluentinc/cp-kafka:7.4.0
-    container_name: kafka
+    container_name: skillradar_kafka
+    hostname: kafka
+    restart: unless-stopped
+    networks:
+      - skillradar_net
     ports:
       - "9092:9092"
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
@@ -42,31 +53,101 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+      start_period: 20s
 
-  # 3. База данных (Склад)
+  # --- ClickHouse ---
   clickhouse:
-    image: clickhouse/clickhouse-server
-    container_name: clickhouse
+    image: clickhouse/clickhouse-server:latest
+    container_name: skillradar_clickhouse
+    hostname: clickhouse
+    restart: unless-stopped
+    networks:
+      - skillradar_net
     ports:
-      - "8123:8123" # HTTP порт (для Metabase)
-      - "9000:9000" # Нативный порт (для скриптов)
+      - "8123:8123"
+      - "9000:9000"
+    environment:
+      CLICKHOUSE_DB: skill_radar
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
     volumes:
-      - ./clickhouse_data:/var/lib/clickhouse  # <--- СОХРАНЯЕМ ДАННЫЕ НА ДИСК
-      - ./logs/clickhouse:/var/log/clickhouse-server
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - ./init_scripts:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-  # 4. Визуализация (Красивые графики)
+  # --- Airflow ---
+  airflow:
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: skillradar_airflow
+    hostname: airflow
+    restart: unless-stopped
+    networks:
+      - skillradar_net
+    environment:
+      # ВАЖНО: Используем SequentialExecutor для SQLite
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./config:/opt/airflow/config
+      - airflow_plugins:/opt/airflow/plugins
+    ports:
+      - "8081:8080"
+    # ВАЖНО: Команда изменена на 'airflow db init'
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com 2>/dev/null || true &&
+      airflow scheduler & airflow webserver
+      "
+    depends_on:
+      kafka:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname) || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
+  # --- Metabase ---
   metabase:
     image: metabase/metabase:latest
-    container_name: metabase
+    container_name: skillradar_metabase
+    restart: unless-stopped
+    networks:
+      - skillradar_net
     ports:
       - "3000:3000"
     volumes:
-      - ./metabase_plugins:/plugins  # Папка для драйверов
+      - metabase_data:/metabase-data
+      - ./metabase_plugins:/plugins
     environment:
       MB_PLUGINS_DIR: /plugins
     depends_on:
-      - clickhouse
+      clickhouse:
+        condition: service_healthy
