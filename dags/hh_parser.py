@@ -1,545 +1,281 @@
 """
-SkillRadar ETL Pipeline - HeadHunter Vacancy Parser
-====================================================
-Назначение: Сбор вакансий с HH.ru API и отправка в Kafka
-Автор: SkillRadar Team
-Версия: 2.0.0
+SkillRadar ETL Pipeline v3.1
+Architecture: ELT (Extract-Load-Transform) with Auth Support
 """
 
 import json
 import os
+import re
+import html
 import random
 import time
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
 
 import pendulum
 import requests
 from kafka import KafkaProducer
-from kafka.errors import KafkaError
 
 from airflow import DAG
-from airflow.models import Variable
 from airflow.operators.python import PythonOperator
 from airflow.utils.log.logging_mixin import LoggingMixin
+from airflow.models import Variable
+
+# ИМПОРТ НАСТРОЕК ИЗ СОСЕДНЕГО ФАЙЛА
+try:
+    from settings import TARGET_COMPANIES, EXCLUDED_KEYWORDS, HH_API_TOKEN
+except ImportError:
+    # Fallback если запуск не из Airflow окружения
+    TARGET_COMPANIES = []
+    EXCLUDED_KEYWORDS = []
+    HH_API_TOKEN = None
 
 # ============================================
-# КОНФИГУРАЦИЯ
+# CONFIGURATION CLASS
 # ============================================
 
 @dataclass
 class Config:
-    """Централизованная конфигурация проекта"""
-    
-    # Роли для поиска
-    TARGET_ROLES: List[str] = None
-    
-    # ID компаний HH.ru
+    # Данные берутся из settings.py
     TARGET_COMPANIES: List[int] = None
+    EXCLUDED_KEYWORDS: List[str] = None
+    HH_API_TOKEN: Optional[str] = None
     
-    # Регион (113 = Россия)
-    AREA_ID: int = 113
-    
-    # Kafka настройки
-    KAFKA_BOOTSTRAP_SERVERS: List[str] = None
+    AREA_ID: int = 113  # Россия
     KAFKA_TOPIC: str = "raw_vacancies"
     
-    # Лимиты API
-    MAX_PAGES_PER_QUERY: int = 5
-    ITEMS_PER_PAGE: int = 20
-    REQUEST_TIMEOUT: int = 10
+    # Лимиты и тайминги
+    MAX_PAGES_PER_COMPANY: int = 5    # Max 500 вакансий на компанию
+    ITEMS_PER_PAGE: int = 100
+    REQUEST_TIMEOUT: int = 15
     
-    # Rate limiting (HH.ru ограничения)
-    DELAY_BETWEEN_PAGES: tuple = (0.3, 0.6)
-    DELAY_DETAIL_REQUEST: float = 1.1  # Минимум 1 секунда для деталей
-    
-    # Retry настройки
+    # Задержки (безопасные для анонимов)
+    DELAY_BETWEEN_PAGES: tuple = (1.0, 2.0)
+    DELAY_DETAIL_REQUEST: float = 1.5
     MAX_RETRIES: int = 3
-    RETRY_BACKOFF_FACTOR: int = 2
     
-    # User-Agent для API
-    USER_AGENT: str = "SkillRadar/2.0 (academic_research; contact@skillradar.local)"
+    USER_AGENT: str = "SkillRadar/3.1 (academic_research)"
     
     def __post_init__(self):
-        """Инициализация значений по умолчанию"""
-        if self.TARGET_ROLES is None:
-            self.TARGET_ROLES = [
-                "Аналитик данных",
-                "Data Engineer",
-                "Product Manager",
-                "Java Developer",
-                "QA Automation Engineer",
-                "Python Developer",
-                "DevOps Engineer"
-            ]
+        # Привязываем импортированные настройки
+        self.TARGET_COMPANIES = TARGET_COMPANIES
+        self.EXCLUDED_KEYWORDS = EXCLUDED_KEYWORDS
+        self.HH_API_TOKEN = HH_API_TOKEN
         
-        if self.TARGET_COMPANIES is None:
-            self.TARGET_COMPANIES = [
-                3529,   # Сбер
-                78638,  # Т-Банк (Тинькофф)
-                1740,   # Яндекс
-                4181,   # Ozon
-                39305,  # Wildberries
-                3776,   # МТС
-                2180,   # VK
-                1122,   # Авито
-            ]
-        
-        if self.KAFKA_BOOTSTRAP_SERVERS is None:
-            kafka_servers = Variable.get(
-                "KAFKA_BOOTSTRAP_SERVERS", 
-                default_var=os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
-            )
-            self.KAFKA_BOOTSTRAP_SERVERS = [kafka_servers]
+        self.KAFKA_BOOTSTRAP_SERVERS = [
+            Variable.get("KAFKA_BOOTSTRAP_SERVERS", default_var="kafka:29092")
+        ]
 
-# Глобальный конфиг и logger
 config = Config()
 logger = LoggingMixin().log
 
 # ============================================
-# МОДЕЛИ ДАННЫХ
+# DATA MODELS & UTILS
 # ============================================
 
 @dataclass
 class VacancyData:
-    """Модель данных вакансии для ClickHouse"""
     id: int
     name: str
     area_name: str
     employer_name: str
-    published_at: str  # ISO 8601 формат для ClickHouse
+    employer_id: int
+    published_at: str
     salary_from: Optional[float]
     salary_to: Optional[float]
     currency: Optional[str]
     key_skills: List[str]
-    search_query: str
+    description: str       # Полный текст
     
     def to_dict(self) -> Dict:
-        """Конвертация в словарь для JSON сериализации"""
         return asdict(self)
 
-# ============================================
-# ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
-# ============================================
+class TextProcessor:
+    TAG_RE = re.compile(r'<[^>]+>')
+    WHITESPACE_RE = re.compile(r'\s+')
 
-class APIRateLimitError(Exception):
-    """Исключение при превышении rate limit"""
-    pass
+    @classmethod
+    def clean_html(cls, raw_html: str) -> str:
+        if not raw_html: return ""
+        text = html.unescape(raw_html)
+        text = cls.TAG_RE.sub(' ', text)
+        return cls.WHITESPACE_RE.sub(' ', text).strip()
 
-class VacancyTransformer:
-    """Трансформация данных вакансий"""
-    
-    @staticmethod
-    def transform(raw_data: Dict, search_query: str) -> VacancyData:
-        """
-        Преобразование сырых данных HH.ru в структурированный формат
-        
-        Args:
-            raw_data: Сырые данные от API
-            search_query: Поисковый запрос (роль)
-            
-        Returns:
-            VacancyData object
-            
-        Raises:
-            ValueError: Если данные невалидны
-        """
-        try:
-            vacancy_id = int(raw_data['id'])
-        except (KeyError, ValueError, TypeError) as e:
-            raise ValueError(f"Invalid vacancy ID: {e}")
-        
-        # Зарплата
-        salary = raw_data.get('salary') or {}
-        salary_from = salary.get('from')
-        salary_to = salary.get('to')
-        
-        # Навыки
-        skills = [
-            skill['name'] 
-            for skill in raw_data.get('key_skills', []) 
-            if skill.get('name')
-        ]
-        
-        # ВАЖНО: published_at оставляем как строку в ISO 8601
-        # ClickHouse сам распарсит её через parseDateTime64BestEffort
-        published_at = raw_data.get('published_at', '')
-        
-        return VacancyData(
-            id=vacancy_id,
-            name=raw_data.get('name', '').strip() or 'Без названия',
-            area_name=raw_data.get('area', {}).get('name', 'Unknown'),
-            employer_name=raw_data.get('employer', {}).get('name', 'Unknown'),
-            published_at=published_at,
-            salary_from=float(salary_from) if salary_from is not None else None,
-            salary_to=float(salary_to) if salary_to is not None else None,
-            currency=salary.get('currency'),
-            key_skills=skills,
-            search_query=search_query
-        )
+# ============================================
+# API CLIENT (WITH AUTH)
+# ============================================
 
 class HHAPIClient:
-    """Клиент для работы с API HeadHunter"""
-    
     def __init__(self, config: Config):
         self.config = config
         self.session = requests.Session()
-        self.session.headers.update({
-            'User-Agent': config.USER_AGENT
-        })
         
-    def _request_with_retry(
-        self, 
-        url: str, 
-        params: Optional[Dict] = None,
-        max_retries: Optional[int] = None
-    ) -> Optional[requests.Response]:
-        """HTTP запрос с повторами при ошибках"""
-        max_retries = max_retries or self.config.MAX_RETRIES
+        headers = {
+            'User-Agent': config.USER_AGENT,
+            'Accept': 'application/json'
+        }
         
-        for attempt in range(max_retries):
+        # Если есть токен - добавляем его
+        if config.HH_API_TOKEN:
+            headers['Authorization'] = f'Bearer {config.HH_API_TOKEN}'
+            logger.info("🔑 API Client: AUTHENTICATED mode")
+        else:
+            logger.info("👤 API Client: ANONYMOUS mode")
+            
+        self.session.headers.update(headers)
+        
+    def _request(self, url: str, params: dict = None):
+        for attempt in range(self.config.MAX_RETRIES):
             try:
                 response = self.session.get(
-                    url, 
-                    params=params, 
-                    timeout=self.config.REQUEST_TIMEOUT
+                    url, params=params, timeout=self.config.REQUEST_TIMEOUT
                 )
                 
-                # Обработка rate limit
+                # Rate Limit (429)
                 if response.status_code == 429:
                     retry_after = int(response.headers.get('Retry-After', 60))
-                    logger.warning(
-                        f"⏳ Rate limit reached. Waiting {retry_after}s... "
-                        f"(Attempt {attempt + 1}/{max_retries})"
-                    )
-                    
-                    if attempt < max_retries - 1:
-                        time.sleep(retry_after)
-                        continue
-                    else:
-                        raise APIRateLimitError(f"Rate limit exceeded after {max_retries} retries")
+                    logger.warning(f"⏳ Rate limit. Sleeping {retry_after}s...")
+                    time.sleep(retry_after)
+                    continue
                 
+                # Token Expired (403)
+                if response.status_code == 403 and self.config.HH_API_TOKEN:
+                    logger.error("⛔ Token expired or forbidden!")
+                    raise Exception("Auth Token Forbidden")
+
                 response.raise_for_status()
                 return response
                 
             except requests.exceptions.RequestException as e:
-                wait_time = self.config.RETRY_BACKOFF_FACTOR ** attempt
-                
-                if attempt == max_retries - 1:
-                    logger.error(f"❌ Request failed after {max_retries} attempts: {e}")
-                    return None
-                
-                logger.warning(
-                    f"⚠️ Request failed (attempt {attempt + 1}/{max_retries}). "
-                    f"Retrying in {wait_time}s... Error: {e}"
-                )
-                time.sleep(wait_time)
-        
+                time.sleep(2 ** attempt)
         return None
-    
-    def search_vacancies(
-        self, 
-        role: str, 
-        company_id: int, 
-        page: int = 0
-    ) -> Optional[Dict]:
-        """Поиск вакансий по роли и компании"""
+
+    def get_company_vacancies(self, company_id: int, page: int = 0):
         params = {
-            'text': role,
             'employer_id': company_id,
             'area': self.config.AREA_ID,
             'per_page': self.config.ITEMS_PER_PAGE,
             'page': page
         }
+        resp = self._request('https://api.hh.ru/vacancies', params)
+        return resp.json() if resp else None
+
+    def get_details(self, vacancy_id: str):
+        resp = self._request(f'https://api.hh.ru/vacancies/{vacancy_id}')
+        return resp.json() if resp else None
+
+# ============================================
+# ETL LOGIC
+# ============================================
+
+class VacancyTransformer:
+    @staticmethod
+    def transform(raw_data: Dict) -> VacancyData:
+        try:
+            vacancy_id = int(raw_data['id'])
+        except:
+            raise ValueError("Invalid ID")
+            
+        salary = raw_data.get('salary') or {}
+        skills = [s.get('name') for s in raw_data.get('key_skills', []) if s.get('name')]
+        clean_desc = TextProcessor.clean_html(raw_data.get('description', ''))
+        employer = raw_data.get('employer', {})
         
-        response = self._request_with_retry(
-            'https://api.hh.ru/vacancies',
-            params=params
+        return VacancyData(
+            id=vacancy_id,
+            name=raw_data.get('name', '') or 'Unknown',
+            area_name=raw_data.get('area', {}).get('name', 'Unknown'),
+            employer_name=employer.get('name', 'Unknown'),
+            employer_id=int(employer.get('id', 0)),
+            published_at=raw_data.get('published_at', ''),
+            salary_from=salary.get('from'),
+            salary_to=salary.get('to'),
+            currency=salary.get('currency'),
+            key_skills=skills,
+            description=clean_desc
         )
-        
-        return response.json() if response else None
-    
-    def get_vacancy_details(self, vacancy_id: str) -> Optional[Dict]:
-        """Получение детальной информации о вакансии"""
-        response = self._request_with_retry(
-            f'https://api.hh.ru/vacancies/{vacancy_id}'
-        )
-        
-        return response.json() if response else None
 
 class KafkaPublisher:
-    """Публикация данных в Kafka"""
-    
     def __init__(self, config: Config):
-        self.config = config
-        self.producer = None
-        self._init_producer()
-    
-    def _init_producer(self):
-        """Инициализация Kafka producer"""
-        try:
-            self.producer = KafkaProducer(
-                bootstrap_servers=self.config.KAFKA_BOOTSTRAP_SERVERS,
-                value_serializer=lambda v: json.dumps(
-                    v, ensure_ascii=False
-                ).encode('utf-8'),
-                acks='all',
-                retries=3,
-                max_in_flight_requests_per_connection=1,
-                compression_type='gzip'
-            )
-            logger.info(
-                f"✅ Kafka producer initialized: "
-                f"{self.config.KAFKA_BOOTSTRAP_SERVERS}"
-            )
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize Kafka producer: {e}")
-            raise
-    
-    def send(self, vacancy: VacancyData) -> bool:
-        """Отправка вакансии в Kafka"""
-        try:
-            future = self.producer.send(
-                self.config.KAFKA_TOPIC,
-                value=vacancy.to_dict()
-            )
-            future.get(timeout=10)
-            return True
-            
-        except KafkaError as e:
-            logger.error(f"❌ Failed to send vacancy {vacancy.id} to Kafka: {e}")
-            return False
-    
+        self.producer = KafkaProducer(
+            bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
+            value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
+            compression_type='gzip',
+            acks='all',
+            retries=3
+        )
+    def send(self, data: VacancyData):
+        self.producer.send(config.KAFKA_TOPIC, value=data.to_dict()).get(timeout=10)
     def close(self):
-        """Закрытие producer"""
-        if self.producer:
-            self.producer.flush()
-            self.producer.close()
-            logger.info("🔒 Kafka producer closed")
-
-# ============================================
-# ОСНОВНАЯ ЛОГИКА ETL
-# ============================================
+        self.producer.flush(); self.producer.close()
 
 class VacancyCollector:
-    """Основной класс сборщика вакансий"""
-    
     def __init__(self, config: Config):
         self.config = config
-        self.api_client = HHAPIClient(config)
-        self.kafka_publisher = KafkaPublisher(config)
-        self.transformer = VacancyTransformer()
-        
-        # Статистика
-        self.stats = {
-            'processed_ids': set(),
-            'sent_count': 0,
-            'error_count': 0,
-            'skipped_duplicates': 0,
-            'start_time': None,
-            'end_time': None
-        }
-    
+        self.client = HHAPIClient(config)
+        self.publisher = KafkaPublisher(config)
+        self.processed_ids = set()
+        self.metrics = {'found': 0, 'sent': 0, 'excluded': 0, 'errors': 0}
+
     def collect(self):
-        """Основной метод сбора вакансий"""
-        self.stats['start_time'] = datetime.now()
-        
-        logger.info(
-            f"🚀 Starting vacancy collection:\n"
-            f"   Roles: {len(self.config.TARGET_ROLES)}\n"
-            f"   Companies: {len(self.config.TARGET_COMPANIES)}\n"
-            f"   Max pages per query: {self.config.MAX_PAGES_PER_QUERY}"
-        )
-        
+        logger.info(f"Targets: {len(self.config.TARGET_COMPANIES)} companies")
         try:
-            for role in self.config.TARGET_ROLES:
-                for company_id in self.config.TARGET_COMPANIES:
-                    self._collect_for_role_company(role, company_id)
+            for cid in self.config.TARGET_COMPANIES:
+                self._process_company(cid)
         finally:
-            self.kafka_publisher.close()
-            self._print_statistics()
-    
-    def _collect_for_role_company(self, role: str, company_id: int):
-        """Сбор вакансий для конкретной роли и компании"""
-        logger.info(f"🔎 Searching: '{role}' @ Company ID {company_id}")
-        
+            self.publisher.close()
+            logger.info(f"Stats: {self.metrics}")
+
+    def _process_company(self, company_id: int):
         page = 0
-        while page < self.config.MAX_PAGES_PER_QUERY:
-            search_result = self.api_client.search_vacancies(
-                role, company_id, page
-            )
+        while page < self.config.MAX_PAGES_PER_COMPANY:
+            data = self.client.get_company_vacancies(company_id, page)
+            if not data or not data.get('items'): break
             
-            if not search_result:
-                logger.warning(f"⚠️ Failed to fetch page {page}")
-                break
-            
-            items = search_result.get('items', [])
-            total_pages = search_result.get('pages', 1)
-            
-            if not items or page >= total_pages:
-                logger.debug(f"✓ No more results at page {page}")
-                break
-            
-            logger.debug(f"   Page {page + 1}/{total_pages}: {len(items)} vacancies")
-            
+            items = data['items']
+            logger.info(f"Company {company_id}: Page {page}, Items {len(items)}")
+            self.metrics['found'] += len(items)
+
             for item in items:
-                self._process_vacancy(item, role)
+                self._process_vacancy(item)
             
+            if page >= data.get('pages', 0) - 1: break
             page += 1
-            if page < total_pages:
-                time.sleep(random.uniform(*self.config.DELAY_BETWEEN_PAGES))
-    
-    def _process_vacancy(self, item: Dict, role: str):
-        """Обработка одной вакансии"""
-        try:
-            vacancy_id = str(item['id'])
-            
-            # Пропускаем дубликаты
-            if vacancy_id in self.stats['processed_ids']:
-                self.stats['skipped_duplicates'] += 1
-                logger.debug(f"⏭️  Skipping duplicate: {vacancy_id}")
-                return
-            
-            self.stats['processed_ids'].add(vacancy_id)
-            
-            # Rate limiting для детальных запросов
-            time.sleep(self.config.DELAY_DETAIL_REQUEST)
-            
-            # Получаем детальную информацию
-            details = self.api_client.get_vacancy_details(vacancy_id)
-            
-            if not details:
-                self.stats['error_count'] += 1
-                logger.warning(f"⚠️ Failed to fetch details: {vacancy_id}")
-                return
-            
-            # Трансформация данных
+            time.sleep(random.uniform(*self.config.DELAY_BETWEEN_PAGES))
+
+    def _process_vacancy(self, item: dict):
+        v_id = str(item['id'])
+        if v_id in self.processed_ids: return
+        self.processed_ids.add(v_id)
+        
+        # Blacklist check
+        name = item.get('name', '').lower()
+        if any(w in name for w in self.config.EXCLUDED_KEYWORDS):
+            self.metrics['excluded'] += 1
+            return
+
+        time.sleep(self.config.DELAY_DETAIL_REQUEST)
+        details = self.client.get_details(v_id)
+        if details:
             try:
-                vacancy_data = self.transformer.transform(details, role)
-            except ValueError as e:
-                self.stats['error_count'] += 1
-                logger.warning(f"⚠️ Invalid data for {vacancy_id}: {e}")
-                return
-            
-            # Отправка в Kafka
-            if self.kafka_publisher.send(vacancy_data):
-                self.stats['sent_count'] += 1
-                
-                if self.stats['sent_count'] % 50 == 0:
-                    logger.info(
-                        f"✅ Progress: {self.stats['sent_count']} sent, "
-                        f"{self.stats['error_count']} errors, "
-                        f"{self.stats['skipped_duplicates']} duplicates"
-                    )
-            else:
-                self.stats['error_count'] += 1
-                
-        except Exception as e:
-            self.stats['error_count'] += 1
-            logger.error(f"❌ Unexpected error processing vacancy: {e}")
-    
-    def _print_statistics(self):
-        """Вывод финальной статистики"""
-        self.stats['end_time'] = datetime.now()
-        duration = self.stats['end_time'] - self.stats['start_time']
-        
-        logger.info(
-            f"\n"
-            f"🏁 Collection completed!\n"
-            f"{'=' * 50}\n"
-            f"Duration: {duration}\n"
-            f"Total processed IDs: {len(self.stats['processed_ids'])}\n"
-            f"✅ Successfully sent: {self.stats['sent_count']}\n"
-            f"⏭️  Skipped duplicates: {self.stats['skipped_duplicates']}\n"
-            f"❌ Errors: {self.stats['error_count']}\n"
-            f"{'=' * 50}"
-        )
+                self.publisher.send(VacancyTransformer.transform(details))
+                self.metrics['sent'] += 1
+            except Exception: self.metrics['errors'] += 1
 
 # ============================================
-# AIRFLOW TASK FUNCTIONS
+# AIRFLOW DAG
 # ============================================
 
-def collect_vacancies(**context):
-    """Airflow task function для сбора вакансий"""
-    logger.info("=" * 60)
-    logger.info("Starting SkillRadar ETL Pipeline")
-    logger.info("=" * 60)
-    
-    try:
-        collector = VacancyCollector(config)
-        collector.collect()
-        
-        # Передаем статистику в XCom
-        context['ti'].xcom_push(
-            key='collection_stats',
-            value={
-                'sent_count': collector.stats['sent_count'],
-                'error_count': collector.stats['error_count'],
-                'unique_vacancies': len(collector.stats['processed_ids']),
-                'timestamp': datetime.now().isoformat()
-            }
-        )
-        
-        logger.info("✅ ETL pipeline completed successfully")
-        
-    except Exception as e:
-        logger.error(f"❌ ETL pipeline failed: {e}")
-        raise
-
-def verify_kafka_connection(**context):
-    """Проверка подключения к Kafka перед запуском"""
-    logger.info("🔍 Verifying Kafka connection...")
-    
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=config.KAFKA_BOOTSTRAP_SERVERS,
-            request_timeout_ms=5000
-        )
-        producer.close()
-        logger.info("✅ Kafka connection verified")
-        
-    except Exception as e:
-        logger.error(f"❌ Kafka connection failed: {e}")
-        raise
-
-# ============================================
-# AIRFLOW DAG DEFINITION
-# ============================================
+def run_etl(**context): 
+    VacancyCollector(config).collect()
 
 default_args = {
     'owner': 'skillradar',
-    'depends_on_past': False,
-    'start_date': pendulum.datetime(2025, 1, 1, tz='UTC'),
-    'email_on_failure': False,
-    'email_on_retry': False,
+    'start_date': pendulum.parse('2025-01-01', tz='UTC'),
     'retries': 1,
     'retry_delay': timedelta(minutes=5),
-    'execution_timeout': timedelta(hours=3),
 }
 
-with DAG(
-    dag_id='skillradar_hh_parser',
-    default_args=default_args,
-    description='SkillRadar: Парсинг вакансий с HeadHunter API',
-    schedule_interval='0 3 * * *',  # Каждый день в 3:00 UTC
-    catchup=False,
-    max_active_runs=1,
-    tags=['skillradar', 'etl', 'headhunter', 'production'],
-    doc_md=__doc__,
-) as dag:
-    
-    # Task 1: Проверка Kafka
-    verify_kafka = PythonOperator(
-        task_id='verify_kafka_connection',
-        python_callable=verify_kafka_connection,
-    )
-    
-    # Task 2: Основной сбор данных
-    collect_data = PythonOperator(
-        task_id='collect_hh_vacancies',
-        python_callable=collect_vacancies,
-    )
-    
-    # Последовательность выполнения
-    verify_kafka >> collect_data
+with DAG('skillradar_hh_parser', default_args=default_args, schedule_interval='0 3 * * *', catchup=False) as dag:
+    PythonOperator(task_id='collect_vacancies', python_callable=run_etl)

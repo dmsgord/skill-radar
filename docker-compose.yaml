@@ -9,12 +9,15 @@ volumes:
   kafka_data:
   clickhouse_data:
   clickhouse_logs:
+  airflow_postgres_data:  # Хранилище для базы Airflow (Postgres)
   airflow_logs:
   airflow_plugins:
   metabase_data:
 
 services:
-  # --- Zookeeper ---
+  # ============================================
+  # ZOOKEEPER
+  # ============================================
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     container_name: skillradar_zookeeper
@@ -28,17 +31,20 @@ services:
     volumes:
       - zookeeper_data:/var/lib/zookeeper/data
     healthcheck:
-      test: echo srvr | nc localhost 2181 || exit 1
+      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
-  # --- Kafka ---
+  # ============================================
+  # KAFKA (С фиксом падений)
+  # ============================================
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     container_name: skillradar_kafka
     hostname: kafka
-    restart: unless-stopped
+    restart: always  # Пытаться подняться до победного
     networks:
       - skillradar_net
     ports:
@@ -54,6 +60,9 @@ services:
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      # ТАЙМАУТЫ: Ждем Zookeeper дольше, чтобы не падать с ошибкой
+      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: "30000"
+      KAFKA_ZOOKEEPER_CONNECTION_TIMEOUT_MS: "30000"
     volumes:
       - kafka_data:/var/lib/kafka/data
     healthcheck:
@@ -61,9 +70,11 @@ services:
       interval: 10s
       timeout: 10s
       retries: 5
-      start_period: 20s
+      start_period: 30s
 
-  # --- ClickHouse ---
+  # ============================================
+  # CLICKHOUSE
+  # ============================================
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     container_name: skillradar_clickhouse
@@ -90,8 +101,31 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+      start_period: 30s
 
-  # --- Airflow ---
+  # ============================================
+  # POSTGRES (Для Airflow)
+  # ============================================
+  postgres_airflow:
+    image: postgres:13
+    container_name: skillradar_postgres
+    restart: unless-stopped
+    networks:
+      - skillradar_net
+    environment:
+      - POSTGRES_USER=airflow
+      - POSTGRES_PASSWORD=airflow
+      - POSTGRES_DB=airflow
+    volumes:
+      - airflow_postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      retries: 5
+
+  # ============================================
+  # AIRFLOW
+  # ============================================
   airflow:
     build:
       context: .
@@ -102,20 +136,18 @@ services:
     networks:
       - skillradar_net
     environment:
-      # ВАЖНО: Используем SequentialExecutor для SQLite
-      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow.db
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres_airflow/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
     volumes:
       - ./dags:/opt/airflow/dags
-      - ./logs:/opt/airflow/logs
       - ./config:/opt/airflow/config
+      - airflow_logs:/opt/airflow/logs
       - airflow_plugins:/opt/airflow/plugins
     ports:
       - "8081:8080"
-    # ВАЖНО: Команда изменена на 'airflow db init'
     command: >
       bash -c "
       airflow db init &&
@@ -127,14 +159,18 @@ services:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
+      postgres_airflow:
+        condition: service_healthy
     healthcheck:
       test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname) || exit 1"]
       interval: 30s
       timeout: 10s
       retries: 3
-      start_period: 60s
+      start_period: 90s
 
-  # --- Metabase ---
+  # ============================================
+  # METABASE
+  # ============================================
   metabase:
     image: metabase/metabase:latest
     container_name: skillradar_metabase
