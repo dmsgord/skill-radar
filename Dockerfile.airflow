@@ -2,25 +2,26 @@ FROM apache/airflow:2.7.1-python3.11
 
 USER root
 
-# Установка системных зависимостей
+# Системные зависимости (если какие-то пакеты будут требовать компиляции) + curl для healthcheck
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-    gcc \
-    g++ \
-    libpq-dev \
+      gcc \
+      g++ \
+      libpq-dev \
+      curl \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
 USER airflow
 
-# Копируем requirements
 COPY requirements.txt /tmp/requirements.txt
 
-# Установка Python зависимостей
+# ВАЖНО:
+# 1) constraints НЕ используем для установки своих зависимостей
+# 2) фиксируем apache-airflow==2.7.1, чтобы pip не "переехал" на другую версию Airflow
 RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r /tmp/requirements.txt
+    pip install --no-cache-dir "apache-airflow==2.7.1" -r /tmp/requirements.txt
 
-# Создаем необходимые директории
 RUN mkdir -p \
     /opt/airflow/dags \
     /opt/airflow/logs \
@@ -28,5 +29,4 @@ RUN mkdir -p \
     /opt/airflow/config \
     /opt/airflow/data
 
-LABEL maintainer="SkillRadar Team"
 WORKDIR /opt/airflow

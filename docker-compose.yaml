@@ -9,15 +9,12 @@ volumes:
   kafka_data:
   clickhouse_data:
   clickhouse_logs:
-  airflow_postgres_data:  # Хранилище для базы Airflow (Postgres)
+  postgres_airflow_data: # Новый том для базы
   airflow_logs:
   airflow_plugins:
   metabase_data:
 
 services:
-  # ============================================
-  # ZOOKEEPER
-  # ============================================
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     container_name: skillradar_zookeeper
@@ -28,84 +25,60 @@ services:
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
       ZOOKEEPER_TICK_TIME: 2000
-    volumes:
-      - zookeeper_data:/var/lib/zookeeper/data
     healthcheck:
-      test: ["CMD-SHELL", "echo srvr | nc localhost 2181 || exit 1"]
+      test: echo srvr | nc zookeeper 2181 || exit 1
       interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
+      retries: 5
+      start_period: 20s
 
-  # ============================================
-  # KAFKA (С фиксом падений)
-  # ============================================
   kafka:
     image: confluentinc/cp-kafka:7.4.0
     container_name: skillradar_kafka
     hostname: kafka
-    restart: always  # Пытаться подняться до победного
+    restart: unless-stopped
     networks:
       - skillradar_net
-    ports:
-      - "9092:9092"
     depends_on:
       zookeeper:
         condition: service_healthy
+    ports:
+      - "9092:9092"
     environment:
       KAFKA_BROKER_ID: 1
-      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
-      # ТАЙМАУТЫ: Ждем Zookeeper дольше, чтобы не падать с ошибкой
-      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: "30000"
-      KAFKA_ZOOKEEPER_CONNECTION_TIMEOUT_MS: "30000"
-    volumes:
-      - kafka_data:/var/lib/kafka/data
+      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: "60000"
+      KAFKA_LOG_RETENTION_HOURS: 24
     healthcheck:
-      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 || exit 1"]
-      interval: 10s
-      timeout: 10s
-      retries: 5
-      start_period: 30s
+      test: nc -z localhost 9092 || exit 1
+      interval: 30s
+      retries: 10
+      start_period: 40s
 
-  # ============================================
-  # CLICKHOUSE
-  # ============================================
   clickhouse:
     image: clickhouse/clickhouse-server:latest
     container_name: skillradar_clickhouse
-    hostname: clickhouse
     restart: unless-stopped
     networks:
       - skillradar_net
     ports:
       - "8123:8123"
       - "9000:9000"
-    environment:
-      CLICKHOUSE_DB: skill_radar
-      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - clickhouse_logs:/var/log/clickhouse-server
+      - ./init_scripts:/docker-entrypoint-initdb.d
     ulimits:
       nofile:
         soft: 262144
         hard: 262144
-    volumes:
-      - clickhouse_data:/var/lib/clickhouse
-      - clickhouse_logs:/var/log/clickhouse-server
-      - ./init_scripts:/docker-entrypoint-initdb.d:ro
     healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
       interval: 10s
-      timeout: 5s
       retries: 5
-      start_period: 30s
 
-  # ============================================
-  # POSTGRES (Для Airflow)
-  # ============================================
   postgres_airflow:
     image: postgres:13
     container_name: skillradar_postgres
@@ -117,21 +90,17 @@ services:
       - POSTGRES_PASSWORD=airflow
       - POSTGRES_DB=airflow
     volumes:
-      - airflow_postgres_data:/var/lib/postgresql/data
+      - postgres_airflow_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U airflow"]
-      interval: 5s
+      interval: 10s
       retries: 5
 
-  # ============================================
-  # AIRFLOW
-  # ============================================
   airflow:
-    build:
+    build: 
       context: .
       dockerfile: Dockerfile.airflow
     container_name: skillradar_airflow
-    hostname: airflow
     restart: unless-stopped
     networks:
       - skillradar_net
@@ -140,17 +109,17 @@ services:
       AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres_airflow/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
       AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     volumes:
       - ./dags:/opt/airflow/dags
-      - ./config:/opt/airflow/config
       - airflow_logs:/opt/airflow/logs
       - airflow_plugins:/opt/airflow/plugins
     ports:
       - "8081:8080"
+    # КОМАНДА: Так как мы очистили тома в Шаге 1, здесь сработает migrate
     command: >
       bash -c "
-      airflow db init &&
+      airflow db migrate &&
       airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com 2>/dev/null || true &&
       airflow scheduler & airflow webserver
       "
@@ -161,16 +130,7 @@ services:
         condition: service_healthy
       postgres_airflow:
         condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "airflow jobs check --job-type SchedulerJob --hostname $(hostname) || exit 1"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
-      start_period: 90s
 
-  # ============================================
-  # METABASE
-  # ============================================
   metabase:
     image: metabase/metabase:latest
     container_name: skillradar_metabase
@@ -181,9 +141,5 @@ services:
       - "3000:3000"
     volumes:
       - metabase_data:/metabase-data
-      - ./metabase_plugins:/plugins
     environment:
-      MB_PLUGINS_DIR: /plugins
-    depends_on:
-      clickhouse:
-        condition: service_healthy
+      MB_DB_FILE: /metabase-data/metabase.db
