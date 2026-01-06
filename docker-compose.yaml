@@ -9,12 +9,13 @@ volumes:
   kafka_data:
   clickhouse_data:
   clickhouse_logs:
-  postgres_airflow_data: # Новый том для базы
+  postgres_airflow_data:
   airflow_logs:
   airflow_plugins:
   metabase_data:
 
 services:
+  # --- BROKER & MESSAGE QUEUE ---
   zookeeper:
     image: confluentinc/cp-zookeeper:7.4.0
     container_name: skillradar_zookeeper
@@ -49,27 +50,29 @@ services:
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      KAFKA_ZOOKEEPER_SESSION_TIMEOUT_MS: "60000"
-      KAFKA_LOG_RETENTION_HOURS: 24
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
     healthcheck:
       test: nc -z localhost 9092 || exit 1
-      interval: 30s
-      retries: 10
-      start_period: 40s
+      interval: 10s
+      retries: 5
+      start_period: 20s
 
+  # --- ANALYTICS DATABASE ---
   clickhouse:
-    image: clickhouse/clickhouse-server:latest
+    image: clickhouse/clickhouse-server:23.8
     container_name: skillradar_clickhouse
+    hostname: clickhouse
     restart: unless-stopped
     networks:
       - skillradar_net
     ports:
-      - "8123:8123"
-      - "9000:9000"
+      - "8123:8123" # HTTP
+      - "9000:9000" # Native
     volumes:
       - clickhouse_data:/var/lib/clickhouse
       - clickhouse_logs:/var/log/clickhouse-server
-      - ./init_scripts:/docker-entrypoint-initdb.d
+      # Монтируем скрипт инициализации таблиц
+      - ./init_scripts/schema.sql:/docker-entrypoint-initdb.d/schema.sql
     ulimits:
       nofile:
         soft: 262144
@@ -78,7 +81,9 @@ services:
       test: wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1
       interval: 10s
       retries: 5
+      start_period: 20s
 
+  # --- AIRFLOW METADATA DB ---
   postgres_airflow:
     image: postgres:13
     container_name: skillradar_postgres
@@ -86,9 +91,9 @@ services:
     networks:
       - skillradar_net
     environment:
-      - POSTGRES_USER=airflow
-      - POSTGRES_PASSWORD=airflow
-      - POSTGRES_DB=airflow
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow_password
+      POSTGRES_DB: airflow
     volumes:
       - postgres_airflow_data:/var/lib/postgresql/data
     healthcheck:
@@ -96,41 +101,86 @@ services:
       interval: 10s
       retries: 5
 
-  airflow:
+  # --- AIRFLOW INITIALIZATION (Runs once) ---
+  airflow-init:
     build: 
       context: .
       dockerfile: Dockerfile.airflow
-    container_name: skillradar_airflow
+    container_name: skillradar_airflow_init
+    networks:
+      - skillradar_net
+    environment:
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow_password@postgres_airflow/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    depends_on:
+      postgres_airflow:
+        condition: service_healthy
+    command: >
+      bash -c "
+      airflow db init &&
+      airflow db migrate &&
+      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com || echo 'User already exists'
+      "
+    restart: "no" # Умирает после выполнения
+
+  # --- AIRFLOW WEBSERVER ---
+  airflow-webserver:
+    build: 
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: skillradar_airflow_webserver
+    restart: unless-stopped
+    networks:
+      - skillradar_net
+    ports:
+      - "8081:8080"
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow_password@postgres_airflow/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__WEBSERVER__EXPOSE_CONFIG: 'true'
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - airflow_logs:/opt/airflow/logs
+      - airflow_plugins:/opt/airflow/plugins
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres_airflow:
+        condition: service_healthy
+    command: airflow webserver
+
+  # --- AIRFLOW SCHEDULER ---
+  airflow-scheduler:
+    build: 
+      context: .
+      dockerfile: Dockerfile.airflow
+    container_name: skillradar_airflow_scheduler
     restart: unless-stopped
     networks:
       - skillradar_net
     environment:
       AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres_airflow/airflow
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow_password@postgres_airflow/airflow
       AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+      # Переменные для наших скриптов
       KAFKA_BOOTSTRAP_SERVERS: kafka:9092
     volumes:
       - ./dags:/opt/airflow/dags
       - airflow_logs:/opt/airflow/logs
       - airflow_plugins:/opt/airflow/plugins
-    ports:
-      - "8081:8080"
-    # КОМАНДА: Так как мы очистили тома в Шаге 1, здесь сработает migrate
-    command: >
-      bash -c "
-      airflow db migrate &&
-      airflow users create --username admin --password admin --firstname Admin --lastname User --role Admin --email admin@example.com 2>/dev/null || true &&
-      airflow scheduler & airflow webserver
-      "
     depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres_airflow:
+        condition: service_healthy
       kafka:
         condition: service_healthy
       clickhouse:
         condition: service_healthy
-      postgres_airflow:
-        condition: service_healthy
+    command: airflow scheduler
 
+  # --- DASHBOARDS ---
   metabase:
     image: metabase/metabase:latest
     container_name: skillradar_metabase

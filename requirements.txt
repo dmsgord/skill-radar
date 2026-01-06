@@ -1,10 +1,6 @@
-kafka-python==2.0.2
-# Убрал версию, чтобы не конфликтовало с ядром Airflow
-requests
-# Убрал версию (конфликт 2.9.9 vs 2.9.7)
-psycopg2-binary
-clickhouse-driver==0.2.6
-clickhouse-connect==0.6.23
-tenacity==8.2.3
-backoff==2.2.1
-apache-airflow-providers-postgres
+kafka-python>=2.0.2
+clickhouse-driver>=0.2.6
+clickhouse-connect>=0.6.23
+beautifulsoup4>=4.12.0
+lxml>=4.9.0
+# Остальное (requests, pendulum, tenacity) уже есть в образе Airflow
