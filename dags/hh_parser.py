@@ -19,8 +19,6 @@ import settings
 
 # --- КОНФИГУРАЦИЯ ---
 HH_API_VACANCIES = "https://api.hh.ru/vacancies"
-KAFKA_TOPIC = "vacancies_enriched"
-KAFKA_SERVERS = ['kafka:9092'] # Исправил опечатку
 
 # User-Agent для "Дзен" режима
 HH_HEADERS = {
@@ -97,14 +95,10 @@ def clean_html(raw_html):
 def get_compiled_skills():
     """
     Компилирует Regex один раз. 
-    Превращает ['go', 'java'] в r'\b(go|java)\b' (с границами слов).
     """
     compiled = {}
     for group, skills in settings.SKILL_DICTIONARY.items():
-        # Экранируем спецсимволы (c++, c#)
         escaped_skills = [re.escape(s) for s in skills]
-        # Собираем паттерн: границы слова + (или|или) + границы
-        # Используем (?i) для игнора регистра
         pattern = re.compile(r'\b(' + '|'.join(escaped_skills) + r')\b', re.IGNORECASE)
         compiled[group] = pattern
     return compiled
@@ -117,10 +111,9 @@ def deep_skill_mining(description_text):
     found = set()
     
     for group, pattern in patterns.items():
-        # findall вернет список совпадений
         matches = pattern.findall(description_text)
         for m in matches:
-            found.add(m.lower()) # Сохраняем в нижнем регистре
+            found.add(m.lower()) 
             
     return list(found)
 
@@ -149,20 +142,12 @@ def random_sleep(min_s=1.0, max_s=3.0):
 # --- ОСНОВНАЯ ЗАДАЧА ---
 def run_parser_v10(**context):
     state = StateManager()
-    producer = None
     
-    try:
-        producer = KafkaProducer(
-            bootstrap_servers=KKA_SERVERS, # В коде выше мы исправили константу, но используем переменную из imports
-            # KafkaProducer требует строку или список. Исправим на KAFKA_SERVERS из конфига
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
-    except NameError: 
-         # Если вдруг забыли поправить константу, хардкод для надежности
-         producer = KafkaProducer(
-            bootstrap_servers=['kafka:9092'],
-            value_serializer=lambda v: json.dumps(v).encode('utf-8')
-        )
+    # ИСПРАВЛЕНО: Берем серверы Kafka напрямую из settings, без try-except костылей
+    producer = KafkaProducer(
+        bootstrap_servers=settings.KAFKA_SERVERS,
+        value_serializer=lambda v: json.dumps(v).encode('utf-8')
+    )
 
     logging.info(f"🧘‍♂️ Zen Parser v10 Started. Companies: {len(settings.TARGET_COMPANIES)}")
     
@@ -172,18 +157,15 @@ def run_parser_v10(**context):
         # 1. WATERMARK
         last_date = state.get_last_date(emp_id)
         if last_date:
-            # Важно: HH требует ISO формат с таймзоной. 
-            # last_date из Postgres уже с TZ (UTC).
             date_from = last_date.isoformat()
             logging.info(f"   Delta load: > {date_from}")
         else:
-            # 30 дней назад, с UTC таймзоной
             date_from = (datetime.now(timezone.utc) - timedelta(days=30)).isoformat()
             logging.info(f"   First load: > {date_from} (30 days)")
 
         # 2. ITERATE
         page = 0
-        total_pages = 1 # Заглушка, обновится после первого запроса
+        total_pages = 1
         max_pub_date = None
         new_count = 0
         
@@ -193,16 +175,15 @@ def run_parser_v10(**context):
                 'date_from': date_from,
                 'per_page': 100,
                 'page': page,
-                'order_by': 'publication_time', # Сортировка по времени
-                'sort_order': 'asc'             # От старых к новым (чтобы ватермарк рос безопасно)
+                'order_by': 'publication_time',
+                'sort_order': 'asc'
             }
             
             try:
-                random_sleep(1.0, 2.5) # Пауза перед листингом
+                random_sleep(1.0, 2.5)
                 resp = safe_request(HH_API_VACANCIES, params=params)
                 data = resp.json()
                 
-                # Обновляем инфо о страницах
                 total_pages = data.get('pages', 0)
                 items = data.get('items', [])
                 
@@ -210,8 +191,6 @@ def run_parser_v10(**context):
                     break
                 
                 for item in items:
-                    # Трекаем самую свежую дату для сохранения стейта
-                    # HH отдает: "2023-10-05T12:00:00+0300"
                     pub_dt = datetime.fromisoformat(item['published_at'])
                     if not max_pub_date or pub_dt > max_pub_date:
                         max_pub_date = pub_dt
@@ -219,10 +198,10 @@ def run_parser_v10(**context):
                     # ФИЛЬТРАЦИЯ
                     category = categorize_and_filter(item.get('name', ''))
                     if not category:
-                        continue # Стоп-лист
+                        continue 
                     
                     # ДЕТАЛИЗАЦИЯ
-                    random_sleep(0.5, 1.5) # Пауза перед чтением детализации
+                    random_sleep(0.5, 1.5)
                     
                     try:
                         full = safe_request(f"{HH_API_VACANCIES}/{item['id']}").json()
@@ -231,35 +210,28 @@ def run_parser_v10(**context):
                         extracted = deep_skill_mining(desc_clean)
                         hh_keys = [s['name'] for s in full.get('key_skills', [])]
                         
-                        # Собираем ПОЛНЫЙ пакет данных (как просило ревью)
                         msg = {
                             'id': int(item['id']),
                             'employer_id': emp_id,
                             'employer_name': emp_name,
                             'url': item.get('alternate_url'),
-                            'published_at': item['published_at'], # Оставляем строку ISO
+                            'published_at': item['published_at'],
                             'name': item['name'],
                             'category': category,
-                            
-                            # Деньги
                             'salary_from': (item.get('salary') or {}).get('from'),
                             'salary_to': (item.get('salary') or {}).get('to'),
                             'currency': (item.get('salary') or {}).get('currency'),
                             'gross': 1 if (item.get('salary') or {}).get('gross') else 0,
-                            
-                            # Мета
                             'experience_id': (full.get('experience') or {}).get('id'),
                             'schedule': (full.get('schedule') or {}).get('name'),
                             'employment': (full.get('employment') or {}).get('name'),
                             'area_name': (full.get('area') or {}).get('name'),
-                            
-                            # Скиллы
                             'key_skills': hh_keys,
                             'extracted_skills': extracted,
                             'description': desc_clean
                         }
                         
-                        producer.send(KAFKA_TOPIC, msg)
+                        producer.send(settings.KAFKA_TOPIC, msg)
                         new_count += 1
                         
                     except Exception as e:
@@ -271,10 +243,8 @@ def run_parser_v10(**context):
                 
             except Exception as e:
                 logging.error(f"Critical error on {emp_name} page {page}: {e}")
-                # Если упали - не идем дальше по этой компании, но сохраним то, что успели (если сортировка была правильной)
                 break
 
-        # КОНЕЦ КОМПАНИИ
         producer.flush()
         if max_pub_date:
             state.update_state(emp_id, emp_name, max_pub_date)
